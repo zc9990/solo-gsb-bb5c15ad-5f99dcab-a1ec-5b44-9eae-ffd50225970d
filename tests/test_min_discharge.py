@@ -3,7 +3,8 @@
 确定性用例覆盖：常绿与普通绿灯下的最小放行量、红灯不放行、deadline 含端点
 （恰等于 deadline 通过可行）、deadline 早于下一次清空、同秒多批按输入顺序
 入队、期初队列、跨零点绿灯、半开范围终点（最后一秒可通过）、无车辆、
-deadline 早于到达秒等无解情形，以及大车辆数不逐辆展开。
+deadline 早于到达秒等无解情形，大车辆数不逐辆展开，以及稀疏绿灯（全天仅
+一个绿灯秒）、长红灯段等非空队列批量推进、不逐秒空转的情形。
 另含 3000 组随机参数下与逐辆展开暴力参考实现（逐放行量扫描）的逐项对照。
 """
 
@@ -264,6 +265,78 @@ def test_large_counts_without_per_vehicle_expansion():
     needed = (10**12 + 10**6 + 999) // 1000
     assert result[0] == needed
     assert result[1] == [999]
+
+
+def test_sparse_green_full_day_huge_queue():
+    # 稀疏绿灯 + 全天范围 + 大车流：跨零点绿灯 [86399, 86400)∪[0,0) 即全天
+    # 仅 t=86399 一个绿灯秒，期初 10^30 辆必须在该秒全部清空，最小放行量即
+    # 10^30。批量推进下该用例只需常数次计数操作（逐秒扫描约需 86400×100 次
+    # 迭代，曾使单次调用约 10 秒）。
+    result = solve(
+        cycle=86400,
+        green_start=86399,
+        green_end=0,
+        forecast_to=86400,
+        initial_queue=10**30,
+        arrivals=[],
+    )
+    assert result == (10**30, [])
+
+
+def test_sparse_green_pass_times_and_deadlines():
+    # 全天仅 t=86399 一个绿灯秒：两批（t=0 到 2 辆、t=50 到 3 辆）都在该秒
+    # 按输入顺序共享容量通过，最小放行量为 5
+    result = solve(
+        cycle=86400,
+        green_start=86399,
+        green_end=0,
+        forecast_to=86400,
+        arrivals=[batch(0, 2, 86399), batch(50, 3, 86399)],
+    )
+    assert result == (5, [86399, 86399])
+    # 第二批 deadline=86398 早于唯一绿灯秒：任何放行量都无法满足，无解
+    assert solve(
+        cycle=86400,
+        green_start=86399,
+        green_end=0,
+        forecast_to=86400,
+        arrivals=[batch(0, 2, 86399), batch(50, 3, 86398)],
+    ) is None
+
+
+def test_long_red_gap_batch_advance_with_nonempty_queue():
+    # 队列非空跨越长红灯段：绿灯 [0,5)，范围 [0,86400)，期初 7 辆在首个绿段
+    # 走 5×d 后剩余车辆要等下一周期（t=86400 起才再有绿灯，超出范围）——
+    # 故期初 7 辆只能在 [0,5) 内清空，d=2 时 t=3 走完（4 绿秒 × 2 = 8 容量）
+    result = solve(
+        cycle=86400,
+        green_start=0,
+        green_end=5,
+        forecast_to=86400,
+        initial_queue=7,
+        arrivals=[],
+    )
+    assert result == (2, [])
+    # 期初 9 辆：5 个绿灯秒 × d >= 9 需 d=2，但 d=2 容量 10 足够
+    result = solve(
+        cycle=86400,
+        green_start=0,
+        green_end=5,
+        forecast_to=86400,
+        initial_queue=9,
+        arrivals=[],
+    )
+    assert result == (2, [])
+    # 期初 11 辆：范围内绿灯容量上限 5×d，d=2 不够、d=3 才够（15 >= 11）
+    result = solve(
+        cycle=86400,
+        green_start=0,
+        green_end=5,
+        forecast_to=86400,
+        initial_queue=11,
+        arrivals=[],
+    )
+    assert result == (3, [])
 
 
 def test_multi_batch_deadlines_increase_required_discharge():
