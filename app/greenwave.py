@@ -157,12 +157,16 @@ headway），故采用动态规划：正向 ``f_j(t) = |t-o_j| + min f_{j-1}(s)`
 
 放行量越大则任何车辆的通过秒只可能更早（可行性对放行量单调），故在
 ``[1, 车辆总数]`` 上二分；上界车辆总数在任意一个绿灯秒即可清空（范围内至少
-存在一个绿灯秒是必要条件，不满足时二分前的可行性试算即返回无解）。每次
-可行性试算都做与排队预测同构的**按批计数**模拟（不逐辆展开）：每秒先入队
-当秒批次再判灯放行，放行后检查 deadline 恰为当秒的批次是否已通过；队列
-清空且下一次到达之前不可能有任何批次到期（deadline 不早于自身到达秒），
-故可直接跳到下一到达秒。无解（含范围内绿灯秒不足以清空、某批 deadline
-无法满足）返回 ``None``。
+存在一个绿灯秒是必要条件，不满足时二分前的可行性试算即返回无解）。范围内
+的绿灯连续段（复用周期展开，含跨零点与常绿）只在二分前展开一次；每次可行
+性试算做与排队预测同构的**按批计数**模拟（不逐辆展开），但只按到达秒作为
+事件时刻**批量推进**：相邻两个到达秒之间没有新车入队，其间放行量为"绿灯
+秒数 × 放行量"的算术量（绿灯秒由段表前缀和与二分夹取给出，跨多个红灯整段
+也只做常数次区间运算），整批通过时由其在绿灯秒序中的位置反解绝对通过秒并
+立即比对该批含端点 deadline（放行动作对给定放行量是确定的先到先走过程，
+批次通过时刻不随后续放行改变，故无需在 deadline 秒停步），不重扫无事件的
+红灯秒；到达秒本身严格保持"先入队当秒批次、再放行"的顺序。无解（含范围
+内绿灯秒不足以清空、某批 deadline 无法满足）返回 ``None``。
 
 冲突车流安全间隔审计
 --------------------
@@ -1379,11 +1383,53 @@ def compute_queue_forecast(
 # ---------- 路口放行能力测算（min discharge） ----------
 
 
+class _GreenTimeline:
+    """预测范围内按时间升序、互不相交的绿灯连续段及其绿灯秒前缀和。
+
+    段集只依赖信号参数（含跨零点与整周期常绿）与预测范围，与每绿灯秒放行量
+    无关，故二分全程只需构建一次（直接复用
+    :func:`_enumerated_green_intervals` 的周期展开结果）。可行性试算在段表上
+    做二分夹取与算术扣减，不逐秒判灯，也不重扫没有任何到达 / deadline 事件
+    的红灯秒。
+    """
+
+    __slots__ = ("segments", "starts", "ends", "prefix", "total")
+
+    def __init__(self, segments: list[Interval]):
+        self.segments = segments
+        self.starts = [seg[0] for seg in segments]
+        self.ends = [seg[1] for seg in segments]
+        total = 0
+        prefix = [0]
+        for start, end in segments:
+            total += end - start
+            prefix.append(total)
+        self.prefix = prefix  # prefix[k] = 前 k 段的绿灯秒数
+        self.total = total
+
+    def count_until(self, t: int) -> int:
+        """严格早于绝对时刻 t 的绿灯秒数（t 可为任意整数，不必落在范围内）。"""
+        idx = bisect_right(self.ends, t)  # 第一个右端点 > t 的段
+        total = self.prefix[idx]
+        if idx < len(self.segments) and self.starts[idx] < t:
+            # t 落在第 idx 段内（其右端点 > t）：计入 [段起点, t) 的部分。
+            total += t - self.starts[idx]
+        return total
+
+    def green_count(self, start: int, end: int) -> int:
+        """半开区间 [start, end) 内的绿灯秒数（start >= end 时为 0）。"""
+        if start >= end:
+            return 0
+        return self.count_until(end) - self.count_until(start)
+
+    def time_of(self, index: int) -> int:
+        """第 index（0 起）个绿灯秒对应的绝对整数秒（0 <= index < total）。"""
+        k = bisect_right(self.prefix, index) - 1  # index 落在第 k 段
+        return self.starts[k] + (index - self.prefix[k])
+
+
 def _simulate_with_deadlines(
-    cycle: int,
-    offset: int,
-    green_start: int,
-    green_end: int,
+    timeline: _GreenTimeline,
     forecast_from: int,
     forecast_to: int,
     discharge_per_second: int,
@@ -1401,15 +1447,20 @@ def _simulate_with_deadlines(
     （含期初队列）须在范围终点 ``forecast_to``（不含）前清空。满足时返回与
     ``batches`` 一一对应的各批通过秒列表，否则返回 ``None``。
 
-    队列为空且尚未到达下一次到达秒时，期间没有任何车辆可放行，且任何未入队
-    批次的 deadline 都不早于其到达秒，故直接跳到下一到达秒，不逐秒空转。
+    模拟按**到达事件时刻**批量推进：相邻两个到达秒之间没有新车入队，其间
+    的放行只需在 :class:`_GreenTimeline` 上一次算出绿灯秒数与容量，按批次
+    计数整体扣减；整批通过时由"该车是区间内第几个绿灯秒放行的第几辆车"
+    反解绝对通过秒并立即比对该批 deadline（晚于即判不可行），不逐秒扫描、
+    也无需在每个 deadline 秒停步——放行动作对 d 确定、按先到先走，批次通过
+    时刻不因继续放行而改变。红灯秒不贡献容量，由段表二分夹取整体跳过
+    （稀疏绿灯 + 长红灯 + 大排队下避免每轮二分重扫数万无事件红灯秒）。每个
+    批次在整个模拟中至多被整批扣减一次，部分扣减每次推进至多触及队首一个
+    批次。
     """
     # 当秒到达的批次下标（保持输入顺序）；范围外到达已由请求侧 422 拦截。
     by_second: dict[int, list[int]] = {}
-    due_by_second: dict[int, list[int]] = {}  # deadline 恰为当秒的批次下标
-    for index, (moment, _count, deadline) in enumerate(batches):
+    for index, (moment, _count, _deadline) in enumerate(batches):
         by_second.setdefault(moment, []).append(index)
-        due_by_second.setdefault(deadline, []).append(index)
 
     pass_times: list[int | None] = [None] * len(batches)
     queue: deque[list[int]] = deque()  # 队首元素：[批次下标（期初为 -1）, 剩余辆数]
@@ -1418,48 +1469,67 @@ def _simulate_with_deadlines(
         queue.append([-1, initial_queue])
         waiting = initial_queue
 
-    arrival_seconds = sorted(by_second)
-    arrival_pos = 0  # 首个尚未到达的到达秒在 arrival_seconds 中的下标
-    now = forecast_from
-    while now < forecast_to:
-        # 1) 当秒到达批次按输入顺序入队。
-        if arrival_pos < len(arrival_seconds) and arrival_seconds[arrival_pos] == now:
-            for index in by_second[now]:
-                queue.append([index, batches[index][1]])
-                waiting += batches[index][1]
-            arrival_pos += 1
-        # 2) 判灯放行：绿灯秒按先到先走放行至多 discharge_per_second 辆。
-        if waiting and is_green(cycle, offset, green_start, green_end, now):
-            remaining = discharge_per_second
-            while remaining and queue:
-                head = queue[0]
-                if head[1] <= remaining:
-                    remaining -= head[1]
-                    waiting -= head[1]
-                    if head[0] >= 0:
-                        pass_times[head[0]] = now  # 该批最后一辆在当秒通过
-                    queue.popleft()
-                else:
-                    head[1] -= remaining
-                    waiting -= remaining
-                    remaining = 0
-        # 3) 含端点 deadline：deadline == now 的批次当秒结束时必须已通过。
-        for index in due_by_second.get(now, ()):
-            if pass_times[index] is None:
-                return None
-        # 4) 跳到下一有效时刻：队列空时直接到下一到达秒；否则推进一秒。
-        if not waiting:
-            if arrival_pos < len(arrival_seconds):
-                now = arrival_seconds[arrival_pos]
+    def drain_span(start: int, end: int) -> bool:
+        """在半开绝对秒区间 [start, end) 内按绿灯容量批量放行（原地改队列）。
+
+        区间内不允许有任何到达事件（调用方保证）：绿灯秒按时间升序排列，
+        第 p（0 起）个绿灯秒放行第 p*d .. (p+1)*d-1 辆（按先到先走），故区间
+        总容量为"绿灯秒数 × d"的纯算术量；某批最后一辆在区间内第 c 个（0
+        起）被放行时，其通过秒即第 c // d 个绿灯秒对应的绝对时刻，此刻直接
+        与该批 deadline 比较（含端点），晚于则整体不可行。红灯秒不贡献容量，
+        无需逐秒判灯。返回该区间内放行是否未触发任何 deadline 违约。
+        """
+        nonlocal waiting
+        if not waiting or start >= end:
+            return True
+        seconds = timeline.green_count(start, end)
+        if not seconds:
+            return True
+        base = timeline.count_until(start)  # start 之前（不含）的绿灯秒数
+        budget = seconds * discharge_per_second
+        consumed = 0  # 本区间已放行的累计辆数
+        while queue and consumed < budget:
+            head = queue[0]
+            count = head[1]
+            if consumed + count <= budget:
+                # 整批在本区间内通过：最后一辆是第 consumed+count-1 辆。
+                consumed += count
+                waiting -= count
+                if head[0] >= 0:
+                    green_index = base + (consumed - 1) // discharge_per_second
+                    passed_at = timeline.time_of(green_index)
+                    if passed_at > batches[head[0]][2]:
+                        return False  # 通过秒晚于该批含端点 deadline：不可行
+                    pass_times[head[0]] = passed_at
+                queue.popleft()
             else:
-                break  # 之后既无车辆也无到达：全部已清空
-        else:
-            now += 1
+                # 容量在队首批次中途耗尽：部分扣减，没有批次在本区间通过完。
+                amount = budget - consumed
+                head[1] = count - amount
+                waiting -= amount
+                consumed = budget
+        return True
+
+    # 只在到达秒停步：上一到达秒到本到达秒之间没有新车，整段批量放行；到达
+    # 秒本身严格保持"先入队当秒批次、再放行"（入队发生在该秒放行之前）。
+    arrival_seconds = sorted(by_second)
+    now = forecast_from
+    for moment in arrival_seconds:
+        if moment > now and not drain_span(now, moment):  # [now, moment)
+            return None
+        for index in by_second[moment]:
+            queue.append([index, batches[index][1]])
+            waiting += batches[index][1]
+        now = moment  # 下一放行区间自当秒起：当秒到达先入队、随后才放行
+
+    # 最后一次到达之后到范围终点：只放行，不再有新车入队。
+    if not drain_span(now, forecast_to):
+        return None
 
     if waiting:
         return None  # 期末仍有待行车辆：未能在范围结束前清空
-    # 理论上不可达：所有 deadline < forecast_to，到期检查必然已触发；
-    # 此处兜底拒绝任何缺失的通过秒。
+    # 理论上不可达：所有 deadline < forecast_to，未通过的批次于此处 waiting
+    # 必为正；此处兜底拒绝任何缺失的通过秒。
     if any(value is None for value in pass_times):
         return None
     return list(pass_times)  # type: ignore[arg-type]
@@ -1495,20 +1565,38 @@ def compute_min_discharge(
     ``[1, 车辆总数]`` 上二分：d=车辆总数 时任一绿灯秒即可清空全部车辆
     （范围内无任何绿灯秒则该上界也不可行，整体返回 ``None``）。每次试算都
     复用 :func:`_simulate_with_deadlines` 的按批计数模拟，不逐辆展开，故与
-    车辆总数大小无关；二分共 O(log(车辆总数)) 次模拟，每次至多遍历范围秒数
-    与批次数。可行时返回 ``(最小放行量, 该放行量下按输入顺序的各批通过秒
-    列表)``；无解（绿灯秒不足、deadline 无法满足等）返回 ``None``。
+    车辆总数大小无关；绿灯段表只在二分前展开一次（与放行量无关），试算只按
+    到达秒在段表上批量推进、整批通过时即比对该批 deadline，无事件的红灯整段
+    由二分夹取跳过，复杂度与范围秒数无关。可行时返回
+    ``(最小放行量, 该放行量下按输入顺序的各批通过秒列表)``；无解（绿灯秒
+    不足、deadline 无法满足等）返回 ``None``。
     """
     batches = list(arrivals)
     total_vehicles = initial_queue + sum(count for _moment, count, _d in batches)
 
+    if total_vehicles == 0:
+        # 无任何车辆：最小正整数放行量为 1，各批通过秒为空列表（无需展开段表）。
+        return 1, []
+
+    # 绿灯段表只依赖信号与范围，二分全程共享一次展开（含跨零点、常绿）。
+    timeline = _GreenTimeline(
+        _enumerated_green_intervals(
+            cycle,
+            offset,
+            green_start,
+            green_end,
+            forecast_from,
+            forecast_to,
+        )
+    )
+    if timeline.total == 0:
+        # 范围内没有任何绿灯秒：再大的放行量也无法清空车辆。
+        return None
+
     def feasible(discharge: int) -> bool:
         return (
             _simulate_with_deadlines(
-                cycle,
-                offset,
-                green_start,
-                green_end,
+                timeline,
                 forecast_from,
                 forecast_to,
                 discharge,
@@ -1518,9 +1606,6 @@ def compute_min_discharge(
             is not None
         )
 
-    if total_vehicles == 0:
-        # 无任何车辆：最小正整数放行量为 1，各批通过秒为空列表。
-        return 1, []
     if not feasible(total_vehicles):
         return None
     lo, hi = 1, total_vehicles
@@ -1531,10 +1616,7 @@ def compute_min_discharge(
         else:
             lo = mid + 1
     pass_times = _simulate_with_deadlines(
-        cycle,
-        offset,
-        green_start,
-        green_end,
+        timeline,
         forecast_from,
         forecast_to,
         lo,

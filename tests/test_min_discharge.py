@@ -292,6 +292,141 @@ def test_multi_batch_deadlines_increase_required_discharge():
     assert result == (6, [0, 2])
 
 
+def test_sparse_green_long_range_huge_queue_is_event_driven():
+    # 稀疏绿灯（全天仅 t=86399 一个绿灯秒）+ 全天范围 + 大排队：可行性判定按
+    # 到达 / 绿灯连续段批量推进，不允许在二分每轮逐秒扫描无事件红灯秒。
+    # 10^30 辆期初队列只能挤在唯一绿灯秒，最小放行量即 10^30，且必须毫秒级
+    # 完成（逐秒扫描实现约需 10 秒）。
+    import time
+
+    params = dict(
+        cycle=86400,
+        offset=0,
+        green_start=86399,
+        green_end=0,  # 跨零点：[86399,86400) ∪ [0,0)，全天只有一个绿灯秒
+        forecast_from=0,
+        forecast_to=86400,
+        initial_queue=10**30,
+        arrivals=[],
+    )
+    start = time.perf_counter()
+    result = compute_min_discharge(**params)
+    elapsed = time.perf_counter() - start
+    assert result == (10**30, [])
+    assert elapsed < 1.0
+
+    # 绿灯秒出现在范围起点时结论对称（仍是唯一绿灯秒、放行量 10^30）。
+    result = compute_min_discharge(**{**params, "green_start": 0, "green_end": 1})
+    assert result == (10**30, [])
+
+    # 期初 10^30 辆 + t=0 到达 1 辆（deadline 同为该绿灯秒）：唯一绿灯秒需一次
+    # 放完 10^30+1 辆，最小放行量即 10^30+1，批次最后通过秒仍为 86399。
+    result = compute_min_discharge(
+        **{**params, "arrivals": [batch(0, 1, 86399)]}
+    )
+    assert result == (10**30 + 1, [86399])
+
+    # 批次 deadline 早于唯一绿灯秒：无论放行量多大都不可能赶上 ⇒ 无解。
+    result = compute_min_discharge(
+        **{**params, "arrivals": [batch(0, 1, 86398)]}
+    )
+    assert result is None
+
+
+def test_long_range_bulk_discharge_matches_reference():
+    # 全天范围、跨零点稀疏周期绿灯：事件批量推进与逐秒（按批计数）参考实现
+    # 在可行性、最小放行量与各批通过秒上必须逐项一致；逐秒参考仍按批计数，
+    # 但范围取满 86400，车辆数刻意保持小值以便逐秒参考在测试内可承受。
+    import random
+
+    from collections import deque as _deque
+
+    from app.greenwave import is_green
+
+    def secondwise_reference(discharge):
+        by_second = {}
+        for index, (moment, _count, _deadline) in enumerate(arrivals):
+            by_second.setdefault(moment, []).append(index)
+        passed = [None] * len(arrivals)
+        queue = _deque()
+        waiting = 0
+        if initial:
+            queue.append([-1, initial])
+            waiting = initial
+        for now in range(forecast_from, forecast_to):
+            for index in by_second.get(now, ()):
+                queue.append([index, arrivals[index][1]])
+                waiting += arrivals[index][1]
+            if waiting and is_green(
+                cycle, offset, green_start, green_end, now
+            ):
+                remaining = discharge
+                while remaining and queue:
+                    head = queue[0]
+                    if head[1] <= remaining:
+                        remaining -= head[1]
+                        waiting -= head[1]
+                        if head[0] >= 0:
+                            passed[head[0]] = now
+                        queue.popleft()
+                    else:
+                        head[1] -= remaining
+                        waiting -= remaining
+                        remaining = 0
+            for index, (_m, _c, deadline) in enumerate(arrivals):
+                if deadline == now and passed[index] is None:
+                    return None
+        if waiting or any(value is None for value in passed):
+            return None
+        return passed
+
+    rng = random.Random(86400)
+    for _ in range(40):
+        cycle = rng.choice([1, 2, 3, 7, 60, 86400])
+        offset = rng.randrange(cycle)
+        kind = rng.randrange(3)
+        if kind == 0:
+            green_start = green_end = rng.randrange(cycle)
+        elif kind == 1:
+            green_start = rng.randrange(cycle)
+            green_end = rng.randrange(cycle)
+            if green_start == green_end:
+                green_end = (green_end + 1) % cycle
+            if green_start > green_end:
+                green_start, green_end = green_end, green_start
+        else:
+            green_start = rng.randrange(cycle)
+            green_end = rng.randrange(cycle)
+            if green_start == green_end:
+                green_start = (green_start + 1) % cycle
+            if green_start < green_end:
+                green_start, green_end = green_end, green_start
+        forecast_from = rng.randrange(0, 200)
+        forecast_to = forecast_from + rng.choice([3600, 86400])
+        initial = rng.randrange(0, 3)
+        arrivals = []
+        for _ in range(rng.randrange(0, 6)):
+            moment = rng.randrange(forecast_from, forecast_to)
+            arrivals.append((moment, rng.randrange(1, 4), rng.randrange(moment, forecast_to)))
+        actual = compute_min_discharge(
+            cycle=cycle,
+            offset=offset,
+            green_start=green_start,
+            green_end=green_end,
+            forecast_from=forecast_from,
+            forecast_to=forecast_to,
+            initial_queue=initial,
+            arrivals=arrivals,
+        )
+        if actual is None:
+            # 放行量取车辆总数（任意绿灯秒即可清空）仍不可行 ⇔ 真的无解。
+            total = initial + sum(count for _t, count, _d in arrivals)
+            assert secondwise_reference(total) is None
+        else:
+            discharge, pass_times = actual
+            assert secondwise_reference(discharge) == pass_times
+
+
 # ---------- 随机对照：逐辆展开 + 逐放行量暴力实现 ----------
 
 
